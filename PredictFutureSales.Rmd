@@ -1,0 +1,217 @@
+---
+title: "PredictFutureSales"
+author: "Chris Bednarczyk"
+date: "11/18/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+library(data.table)
+library(forecast)
+library(doParallel)
+library(knitr)
+```
+
+## Introduction
+This is part of the Kaggle competition Predict Future Sales. The goal is to analyze daily sales data from 1C Company and predict total sales for each product and store for a month.
+
+## Data
+A set of training data are provided, representing daily sales from January 2013 to October 2015. Additional information on the sales items and stores are provided.
+```{r, echo=FALSE}
+trainData = fread("Data/sales_train.csv")
+items = fread("Data/items.csv")
+itemCateg = fread("Data/item_categories.csv")
+# shops = fread("Data/shops.csv")
+# Merge item category ID into trainData.
+trainData = merge(trainData, items[,.(item_id,item_category_id)], by="item_id")
+testData = fread("Data/test.csv")
+# Attach unique item-shop ID to trainData by looking up in test.
+trainData = merge(testData, trainData, by=c("item_id","shop_id"))
+```
+### Preprocessing
+The date column is converted to a standard YYYY-MM-DD format. Missing entries are removed. The start of the time series is set to January 2013.
+```{r}
+# Convert date to Date object.
+trainData[,date:=as.Date(date,"%d.%m.%Y")]
+# Remove entries with missing date_block_num
+trainData = trainData[complete.cases(trainData),]
+smonth = min(trainData[,date_block_num])
+emonth = max(trainData[,date_block_num])
+start = c(2013,1)
+frequency = 12
+```
+
+## Time Series Modeling
+```{r, echo=FALSE}
+rmse <- function(errors) {
+     sqrt(mean(errors^2,na.rm=TRUE))
+}
+modelList <- function(basets, errors) {
+     n = length(basets)
+     s = time(basets)[2]
+     f = frequency(basets)
+     l = list(ts=ts(basets[-1]-errors[-n],start=s,frequency=f), errors=ts(errors[-n],start=s,frequency=f))
+     l$rmse = rmse(l$errors)
+     l$mape = 100 * mean(abs(l$errors/l$ts),na.rm=TRUE)
+     l
+}
+farima <- function(x,h) {
+     forecast(auto.arima(x),h=h)
+}
+modelTimeSeries <- function(ts.x, forecastLength=1, includeModels=NULL) {
+     tsList = list()
+     possibleModels = c("naive","mean","snaive","drift","ses","holt","arima")
+     # Only retain included models.
+     if (is.null(includeModels)) {
+             models = possibleModels
+     } else {
+             models = includeModels
+     }
+     if ("naive" %in% models) {
+             tsList[["naive"]] = modelList(ts.x, tsCV(ts.x, naive, h=forecastLength))
+     }
+     if ("mean" %in% models) {
+             tsList[["mean"]] = modelList(ts.x, tsCV(ts.x, meanf, h=forecastLength))
+     }
+     if ("snaive" %in% models) {
+             tsList[["snaive"]] = modelList(ts.x, tsCV(ts.x, snaive, h=forecastLength))
+     }
+     if ("drift" %in% models) {
+             tsList[["drift"]] = modelList(ts.x, tsCV(ts.x, rwf, drift=TRUE, h=forecastLength))
+     }
+     if ("ses" %in% models) {
+             tsList[["ses"]] = modelList(ts.x, tsCV(ts.x, ses, h=forecastLength))
+     }
+     if ("holt" %in% models) {
+             tsList[["holt"]] = modelList(ts.x, tsCV(ts.x, holt, h=forecastLength))
+     }
+     if ("arima" %in% models) {
+             tsList[["arima"]] = modelList(ts.x, tsCV(ts.x, farima, h=forecastLength))
+     }
+     tsList
+}
+
+finalPrediction <- function(ints, type, h=1) {
+        if (type == "naive") {
+                f = naive(ints, h=h)
+        } else if (type == "mean") {
+                f = meanf(ints, h=h)
+        } else if (type == "snaive") {
+                f = snaive(ints, h=h)
+        } else if (type == "drift") {
+                f = rwf(ints, drift=TRUE, h=h)
+        } else if (type == "ses") {
+                f = ses(ints, h=h)
+        } else if (type == "holt") {
+                f = holt(ints, h=h)
+        } else if (type == "arima") {
+                f = farima(ints, h=h)
+        }
+        f$mean
+}
+plotModels <- function(basets, l, main="") {
+     plot(basets, lwd=2, ylab="", main=main)
+     n = length(l)
+     colors = colorRampPalette(c("cyan","blue","green","yellow","orange","red","violet"))(n)
+     for (i in 1:n) {
+          lines(l[[i]]$ts, col=colors[i])
+     }
+     lims = par("usr")
+     legend(lims[1], lims[4], c("OBS",toupper(names(l))), col=c("black",colors), lty=1)
+     
+}
+bestModel <- function(l) {
+     names(l)[which.min(unlist(lapply(l,function(l){l$rmse})))]
+}
+```
+
+### All Sales
+Total sales across all items and shops are tested first to explore different modeling options. I tested seven types of models. The plot shows the observed data and results from each prediction model with rolling forecast origin. For example, the February 2013 predicted value is based on a model trained on January 2013. March 2013 is based on a model trained on January and February 2013, and so on. This time series cross validation is used to calculate root mean square error (RMSE) and mean absolute percent error (MAPE) for each model type, and the type with the lowest RMSE is selected as the best.
+
+Model Type                         Description
+----------                         -----------
+Naive                              Uses value from previous time step (persistence forecast)
+Mean                               Uses mean from historical data
+Seasonal Naive                     Uses value from previous iteration of this season
+Drift                              Extrapolates historical trend
+Simple Exponential Smoothing (SES) Weighted average of historical data, giving more weight to more recent observations
+Holt                               Simple Exponential Smoothing with additional trend component
+ARIMA                              Auto Regressive Integrated Moving Average, general class of models that can handle wider variety of correlation in time series means and errors
+
+```{r, cache=TRUE}
+# Monthly, all items, all shops
+monthlyData.all = merge(data.table(date_block_num=seq(smonth,emonth)),
+                        trainData[,.(SalesCount=sum(item_cnt_day)),date_block_num],
+                        by="date_block_num", all=TRUE)
+monthlyData.all[is.na(SalesCount),SalesCount:=0]
+setorder(monthlyData.all, date_block_num)
+# Create time series object and fit models to it.
+ts.all = ts(monthlyData.all$SalesCount, start=start, frequency=frequency)
+tl.all = modelTimeSeries(ts.all)
+# Plot time series and 1 month forward forecasts each time step
+p = plotModels(ts.all, tl.all)
+# Find best model.
+best = bestModel(tl.all)
+pred.all = finalPrediction(ts.all, best, h=1)
+```
+The best model for the historical data is determined to be **`r best`**.
+
+### Sales by Item Category
+The same model fitting process was performed for each of the **`r length(unique(trainData$item_category_id))`** different item categories.
+```{r, cache=TRUE}
+monthlyData.category = merge(as.data.table(expand.grid(item_category_id=sort(unique(trainData$item_category_id)),date_block_num=seq(smonth,emonth))), trainData[,.(SalesCount=sum(item_cnt_day)),.(item_category_id,date_block_num)], by=c("item_category_id","date_block_num"), all=TRUE)
+monthlyData.category[is.na(SalesCount),SalesCount:=0]
+setorder(monthlyData.category, item_category_id, date_block_num)
+categoryList = sort(unique(monthlyData.category$item_category_id))
+numcores = max(1, detectCores()-1)
+cl = makeCluster(numcores)
+evalout = clusterEvalQ(cl, {library(data.table);library(forecast)})
+clusterExport(cl, c("monthlyData.category","start","frequency","modelTimeSeries","modelList","bestModel","rmse","farima","finalPrediction"))
+pred.category = do.call('rbind', parLapply(cl, categoryList, function(category) {
+        ts.this = ts(monthlyData.category[item_category_id==category,SalesCount],start=start,frequency=frequency)
+        tl.this = modelTimeSeries(ts.this)
+        best = bestModel(tl.this)
+        data.table(ItemCategory=category, BestModel=best, BestModelRMSE=tl.this[[best]]$rmse, BestModelMAPE=tl.this[[best]]$mape, ForecastSalesCount=max(0, finalPrediction(ts.this,best)))
+}))
+stopCluster(cl)
+```
+The count for each model type for which it was the best fit for a category is shown below. The **`r names(sort(table(pred.category$BestModel),decreasing=TRUE))[1]`** type is the most common best model type.
+`r kable(pred.category[,.N,BestModel], "simple", caption="Number of Times Each Model Type Is Best")`
+
+
+### Sales by Item and Shop
+Finally, the same model fitting process is done on each combination of items and shops. Since ARIMA models take much more time to fit than the others and there are more than 100,000 time series in this section, I made the decision to only fit the following model types for each time series and select the best for prediction: naive, mean, SES.
+```{r, cache=TRUE}
+monthlyData.ID = merge(as.data.table(expand.grid(ID=sort(unique(trainData$ID)),date_block_num=seq(smonth,emonth))),
+                             trainData[,.(SalesCount=sum(item_cnt_day)),.(ID,date_block_num)],
+                             by=c("ID","date_block_num"), all=TRUE)
+monthlyData.ID[is.na(SalesCount),SalesCount:=0]
+setorder(monthlyData.ID, ID, date_block_num)
+idList = sort(unique(monthlyData.ID$ID))
+
+numcores = max(1, detectCores()-1)
+cl = makeCluster(numcores)
+evalout = clusterEvalQ(cl, {library(data.table);library(forecast)})
+clusterExport(cl, c("monthlyData.ID","start","frequency","modelTimeSeries","modelList","bestModel","rmse","farima","finalPrediction"))
+pred.ID = do.call('rbind', parLapply(cl, idList, function(id) {
+        ts.this = ts(monthlyData.ID[ID==id,SalesCount],start=start,frequency=frequency)
+        tl.this = modelTimeSeries(ts.this, includeModels=c("naive","mean","ses"))
+        best = bestModel(tl.this)
+        data.table(ID=id, BestModel=best, BestModelRMSE=tl.this[[best]]$rmse, BestModelMAPE=tl.this[[best]]$mape, item_cnt_month=max(0, finalPrediction(ts.this,best)))
+}))
+stopCluster(cl)
+# Merge with testData so there are no missing IDs.
+pred.ID = merge(testData, pred.ID, by="ID", all.x=TRUE)
+pred.ID[is.na(item_cnt_month),item_cnt_month:=0]
+```
+The count for each model type for which it was the best fit for a item-shop ID is shown below. The **`r names(sort(table(pred.ID[!is.na(BestModel),BestModel]),decreasing=TRUE))[1]`** type is the most common best model type.
+`r kable(pred.ID[!is.na(BestModel),.N,BestModel], "simple", caption="Number of Times Each Model Type Is Best")`
+
+```{r}
+# Output final predictions to file.
+dir.create("Output", recursive=TRUE)
+pred.ID[is.na(item_cnt_month),item_cnt_month:=0]
+fwrite(pred.ID[,.(ID,item_cnt_month)], "Output/submission.csv")
+```
